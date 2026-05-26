@@ -1,175 +1,159 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <signal.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <libgen.h>
 
 #define BUFFER_SIZE 8192
-
-volatile int keep_running = 1;
-
-void handle_sigint(int sig) {
-    (void)sig; 
-    keep_running = 0;
-}
+#define NUM_THREADS 3
 
 typedef void (*set_key_func)(char);
 typedef void (*caesar_func)(void*, void*, int);
 
-typedef struct {
-    unsigned char buffer[BUFFER_SIZE];
-    size_t bytes_in_buffer;
-    int eof_reached;
-    int data_ready;
-    FILE *in_file;
-    FILE *out_file;
+pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+int copied_files_count = 0;
+int current_file_index = 0; 
+
+char **files_to_copy;
+int total_files = 0;
+const char *out_dir;
+caesar_func caesar;
+
+void* worker_thread(void* arg) {
+    (void)arg;
     
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_prod;
-    pthread_cond_t cond_cons;
-    
-    caesar_func caesar;
-} shared_data_t;
-
-void* producer_thread(void* arg) {
-    shared_data_t *data = (shared_data_t*)arg;
-
-    while (keep_running && !data->eof_reached) {
-        pthread_mutex_lock(&data->mutex);
-
-        while (data->data_ready && keep_running) {
-            pthread_cond_wait(&data->cond_prod, &data->mutex);
+    while (1) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
+        
+        int lock_res = pthread_mutex_timedlock(&counter_mutex, &ts);
+        if (lock_res == ETIMEDOUT) {
+            printf("Возможная взаимоблокировка: поток %lu ожидает мьютекс более 5 секунд\n", pthread_self());
+            pthread_exit(NULL); 
         }
-
-        if (!keep_running) {
-            pthread_mutex_unlock(&data->mutex);
-            break;
+        
+        if (current_file_index >= total_files) {
+            pthread_mutex_unlock(&counter_mutex);
+            break; 
         }
-
-        size_t bytes_read = fread(data->buffer, 1, BUFFER_SIZE, data->in_file);
-
-        if (bytes_read < BUFFER_SIZE) {
-            if (feof(data->in_file) || ferror(data->in_file)) {
-                data->eof_reached = 1;
+        
+        int my_file_idx = current_file_index;
+        current_file_index++;
+        pthread_mutex_unlock(&counter_mutex);
+        
+        const char *input_path = files_to_copy[my_file_idx];
+        
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        
+        char path_copy[1024];
+        strncpy(path_copy, input_path, sizeof(path_copy) - 1);
+        path_copy[sizeof(path_copy) - 1] = '\0';
+        char *filename = basename(path_copy);
+        
+        char out_path[2048];
+        snprintf(out_path, sizeof(out_path), "%s/%s", out_dir, filename);
+        
+        int is_success = 0;
+        FILE *in = fopen(input_path, "rb");
+        if (in) {
+            FILE *out = fopen(out_path, "wb");
+            if (out) {
+                unsigned char buffer[BUFFER_SIZE];
+                size_t bytes_read;
+                is_success = 1;
+                while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, in)) > 0) {
+                    caesar(buffer, buffer, bytes_read);
+                    fwrite(buffer, 1, bytes_read, out);
+                }
+                fclose(out);
             }
+            fclose(in);
         }
-
-        if (bytes_read > 0) {
-            data->caesar(data->buffer, data->buffer, bytes_read);
+        
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double time_spent = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
+        lock_res = pthread_mutex_timedlock(&counter_mutex, &ts);
+        if (lock_res == ETIMEDOUT) {
+            printf("Возможная взаимоблокировка: поток %lu ожидает мьютекс более 5 секунд\n", pthread_self());
+            pthread_exit(NULL);
+        }
+        
+        if (is_success) {
+            copied_files_count++;
+        }
+        
+        FILE *log_file = fopen("log.txt", "a");
+        if (log_file) {
+            time_t now = time(NULL);
+            char *time_str = ctime(&now); // Используем ctime, как рекомендовано в PDF
+            time_str[strcspn(time_str, "\n")] = 0; // Удаляем лишний перенос строки
             
-            data->bytes_in_buffer = bytes_read;
-            data->data_ready = 1;
+            fprintf(log_file, "[%s] Process/Thread: %lu, File: %s, Result: %s, Time: %.4f sec\n",
+                    time_str, pthread_self(), filename, is_success ? "Success" : "Error", time_spent);
+            fclose(log_file);
         }
-
-        pthread_cond_signal(&data->cond_cons);
-        pthread_mutex_unlock(&data->mutex);
+        
+        pthread_mutex_unlock(&counter_mutex);
     }
-    return NULL;
-}
-
-void* consumer_thread(void* arg) {
-    shared_data_t *data = (shared_data_t*)arg;
-
-    while (keep_running) {
-        pthread_mutex_lock(&data->mutex);
-
-        while (!data->data_ready && keep_running && !data->eof_reached) {
-            pthread_cond_wait(&data->cond_cons, &data->mutex);
-        }
-
-        if (!keep_running || (!data->data_ready && data->eof_reached)) {
-            pthread_mutex_unlock(&data->mutex);
-            break;
-        }
-
-        fwrite(data->buffer, 1, data->bytes_in_buffer, data->out_file);
-        data->data_ready = 0;
-
-        pthread_cond_signal(&data->cond_prod);
-        pthread_mutex_unlock(&data->mutex);
-    }
+    
     return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        fprintf(stderr, "Использование: %s <input_file> <output_file> <key>\n", argv[0]);
-        return EXIT_FAILURE;
+    if (argc < 4) {
+        printf("Использование: ./secure_copy file1.txt file2.txt ... output_dir/ key\n");
+        return 1;
     }
-
-    const char *input_path = argv[1];
-    const char *output_path = argv[2];
-    char key = (char)atoi(argv[3]);
-
-    struct sigaction sa;
-    sa.sa_handler = handle_sigint;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-
+    
+    total_files = argc - 3;
+    files_to_copy = (char **)&argv[1];
+    out_dir = argv[argc - 2];
+    char key = (char)atoi(argv[argc - 1]);
+    
     void *handle = dlopen("./libcaesar.so", RTLD_LAZY);
     if (!handle) {
-        fprintf(stderr, "Ошибка загрузки библиотеки: %s\n", dlerror());
-        return EXIT_FAILURE;
+        printf("Ошибка загрузки библиотеки: %s\n", dlerror());
+        return 1;
     }
-
-    set_key_func set_key = (set_key_func)dlsym(handle, "set_key");
-    caesar_func caesar = (caesar_func)dlsym(handle, "caesar");
-
-    if (!set_key || !caesar) {
-        fprintf(stderr, "Ошибка загрузки символов: %s\n", dlerror());
-        dlclose(handle);
-        return EXIT_FAILURE;
-    }
-
-    set_key(key);
-
-    FILE *in = fopen(input_path, "rb");
-    if (!in) {
-        perror("Ошибка открытия входного файла");
-        dlclose(handle);
-        return EXIT_FAILURE;
-    }
-
-    FILE *out = fopen(output_path, "wb");
-    if (!out) {
-        perror("Ошибка открытия выходного файла");
-        fclose(in);
-        dlclose(handle);
-        return EXIT_FAILURE;
-    }
-
-    shared_data_t data = {0};
-    data.in_file = in;
-    data.out_file = out;
-    data.caesar = caesar;
     
-    pthread_mutex_init(&data.mutex, NULL);
-    pthread_cond_init(&data.cond_prod, NULL);
-    pthread_cond_init(&data.cond_cons, NULL);
-
-    pthread_t prod_tid, cons_tid;
-    pthread_create(&prod_tid, NULL, producer_thread, &data);
-    pthread_create(&cons_tid, NULL, consumer_thread, &data);
-
-    pthread_join(prod_tid, NULL);
-    pthread_join(cons_tid, NULL);
-
-    pthread_mutex_destroy(&data.mutex);
-    pthread_cond_destroy(&data.cond_prod);
-    pthread_cond_destroy(&data.cond_cons);
-
-    fclose(in);
-    fclose(out);
-    dlclose(handle);
-
-    if (!keep_running) {
-        printf("Операция прервана пользователем\n");
-    } else {
-        printf("Копирование и шифрование успешно завершено.\n");
+    set_key_func set_key = (set_key_func)dlsym(handle, "set_key");
+    caesar = (caesar_func)dlsym(handle, "caesar");
+    
+    if (!set_key || !caesar) {
+        printf("Ошибка загрузки символов: %s\n", dlerror());
+        dlclose(handle);
+        return 1;
     }
-
-    return EXIT_SUCCESS;
+    set_key(key);
+    
+    struct stat st = {0};
+    if (stat(out_dir, &st) == -1) {
+        mkdir(out_dir, 0700);
+    }
+    
+    pthread_t threads[NUM_THREADS];
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, NULL);
+    }
+    
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    dlclose(handle);
+    printf("Счетчик скопированных файлов: %d\n", copied_files_count);
+    
+    return 0;
 }
